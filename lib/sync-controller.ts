@@ -33,18 +33,26 @@ export function runSync(vaultId: string, opts: RunSyncOptions = {}): Promise<Syn
     const { start, setStatus, finish, fail } = useSyncStore.getState();
     start(vaultId);
     try {
-      const result = await syncVault(vault, { token }, user, (label) => setStatus(label), {
-        // If the vault isn't marked dirty, skip the slow statusMatrix/commitAll walk.
-        skipCommitIfClean: !vault.dirty,
-      });
-      // A successful full sync leaves the working tree in a known-clean state:
-      // we either committed dirty files and pushed them, or there was nothing
-      // to commit. Either way, clear the dirty flag.
+      // Snapshot the dirty paths at sync-start. If the user edits again mid-sync,
+      // those edits stay queued for the next sync (won't be lost).
+      const dirtyPaths = [...(vault.dirtyPaths ?? [])];
+      const result = await syncVault(
+        vault,
+        { token },
+        user,
+        (label) => setStatus(label),
+        { dirtyPaths },
+      );
+      // Successful sync: mark remote state + clear the paths we just committed.
       await useVaultStore.getState().updateVault(vaultId, {
         lastSyncedAt: Date.now(),
         lastFetchedAt: Date.now(),
         remoteAhead: false,
-        dirty: false,
+        // Only clear the paths that were in this sync's snapshot — preserves
+        // any new edits that happened during the sync itself.
+        dirtyPaths: (useVaultStore.getState().getVault(vaultId)?.dirtyPaths ?? []).filter(
+          (p) => !dirtyPaths.includes(p),
+        ),
       });
       finish({ vaultId, conflicts: result.conflicts });
       return result;

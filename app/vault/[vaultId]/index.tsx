@@ -136,9 +136,13 @@ export default function ExplorerScreen() {
               <IconSymbol
                 name="arrow.clockwise"
                 size={22}
-                color={vault?.dirty || vault?.remoteAhead ? theme.accent : theme.textDim}
+                color={
+                  (vault?.dirtyPaths?.length ?? 0) > 0 || vault?.remoteAhead
+                    ? theme.accent
+                    : theme.textDim
+                }
               />
-              {vault?.dirty ? (
+              {(vault?.dirtyPaths?.length ?? 0) > 0 ? (
                 <View
                   style={[styles.badge, { backgroundColor: theme.warn, borderColor: theme.bg }]}
                 />

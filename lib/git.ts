@@ -82,6 +82,47 @@ export async function pullVault(vault: Vault, auth: Auth): Promise<void> {
   });
 }
 
+/**
+ * Commits a known set of paths relative to the repo root. Skips the
+ * expensive `statusMatrix` walk that `commitAll` does — intended to be
+ * called with the `dirtyPaths` list maintained by the vault store.
+ *
+ * A path that no longer exists on disk is treated as a deletion.
+ */
+export async function commitPaths(
+  vault: Vault,
+  paths: string[],
+  message: string,
+  user: { login: string; name: string | null },
+): Promise<string | null> {
+  if (paths.length === 0) return null;
+  const fs = createGitFs(vaultDirUri(vault.id));
+  let staged = 0;
+  for (const filepath of paths) {
+    try {
+      await fs.promises.stat(`${gitDir}/${filepath}`);
+      await git.add({ fs, dir: gitDir, filepath });
+      staged += 1;
+    } catch {
+      try {
+        await git.remove({ fs, dir: gitDir, filepath });
+        staged += 1;
+      } catch {
+        // File was never tracked — nothing to do.
+      }
+    }
+  }
+  if (staged === 0) return null;
+  return git.commit({
+    fs,
+    dir: gitDir,
+    message,
+    author: author(user),
+  });
+}
+
+/** Full-scan variant — slow on large vaults, used as a fallback for
+ *  "force rescan" operations (e.g. after external changes). */
 export async function commitAll(
   vault: Vault,
   message: string,

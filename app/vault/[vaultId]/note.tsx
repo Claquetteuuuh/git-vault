@@ -6,7 +6,6 @@ import {
   Pressable,
   ScrollView,
   StyleSheet,
-  TextInput,
   View,
 } from 'react-native';
 import { router, useLocalSearchParams } from 'expo-router';
@@ -15,14 +14,15 @@ import { Screen } from '@/components/ui/screen';
 import { Text } from '@/components/ui/text';
 import { IconSymbol } from '@/components/ui/icon-symbol';
 import { LiquidPill } from '@/components/ui/liquid-pill';
-import { MarkdownViewer } from '@/components/markdown-viewer';
+import { MarkdownEditor, type MarkdownEditorRef } from '@/components/note-editor/markdown-editor';
 import { radii, space } from '@/constants/theme';
 import { useTheme } from '@/hooks/use-theme-color';
 import { basename, readNote, writeNote } from '@/lib/vault-fs';
-import { splitFrontmatter } from '@/lib/frontmatter';
 import { useVaultStore } from '@/store/vaults';
 
 const SAVE_DEBOUNCE_MS = 600;
+// Approximate rendered height of the two liquid-glass pills + their row padding.
+const TOOLBAR_HEIGHT = 60;
 
 type SaveState = 'idle' | 'dirty' | 'saving' | 'saved' | 'error';
 
@@ -31,32 +31,20 @@ export default function NoteScreen() {
   const { vaultId, path } = useLocalSearchParams<{ vaultId: string; path: string }>();
 
   const [original, setOriginal] = useState<string | null>(null);
-  const [draft, setDraft] = useState<string>('');
   const [error, setError] = useState<string | null>(null);
-  const [editing, setEditing] = useState(false);
   const [saveState, setSaveState] = useState<SaveState>('idle');
-  const [selection, setSelection] = useState({ start: 0, end: 0 });
   const [keyboardHeight, setKeyboardHeight] = useState(0);
-  const [undoStack, setUndoStack] = useState<string[]>([]);
-  const [redoStack, setRedoStack] = useState<string[]>([]);
+  const draftRef = useRef<string>('');
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const lastSnapshotTime = useRef(0);
-  const inputRef = useRef<TextInput>(null);
-
-  const canUndo = undoStack.length > 0;
-  const canRedo = redoStack.length > 0;
+  const editorRef = useRef<MarkdownEditorRef>(null);
 
   // Track the real keyboard frame height so the toolbar can dock at the exact
-  // top edge of the keyboard, bypassing KeyboardAvoidingView's quirks.
+  // top edge of the keyboard, not at some KeyboardAvoidingView guess.
   useEffect(() => {
     const showEvent = Platform.OS === 'ios' ? 'keyboardWillShow' : 'keyboardDidShow';
     const hideEvent = Platform.OS === 'ios' ? 'keyboardWillHide' : 'keyboardDidHide';
-    const showSub = Keyboard.addListener(showEvent, (e) => {
-      setKeyboardHeight(e.endCoordinates.height);
-    });
-    const hideSub = Keyboard.addListener(hideEvent, () => {
-      setKeyboardHeight(0);
-    });
+    const showSub = Keyboard.addListener(showEvent, (e) => setKeyboardHeight(e.endCoordinates.height));
+    const hideSub = Keyboard.addListener(hideEvent, () => setKeyboardHeight(0));
     return () => {
       showSub.remove();
       hideSub.remove();
@@ -67,11 +55,8 @@ export default function NoteScreen() {
     setError(null);
     try {
       const txt = await readNote(vaultId, path);
+      draftRef.current = txt;
       setOriginal(txt);
-      setDraft(txt);
-      setUndoStack([]);
-      setRedoStack([]);
-      lastSnapshotTime.current = 0;
       setSaveState('idle');
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
@@ -87,8 +72,9 @@ export default function NoteScreen() {
       try {
         setSaveState('saving');
         await writeNote(vaultId, path, contents);
-        setOriginal(contents);
-        await useVaultStore.getState().updateVault(vaultId, { dirty: true });
+        // Track this specific path as dirty so the sync flow can commit
+        // only it, not re-scan the entire working tree.
+        await useVaultStore.getState().addDirtyPath(vaultId, path);
         setSaveState('saved');
       } catch (err) {
         setError(err instanceof Error ? err.message : String(err));
@@ -98,53 +84,15 @@ export default function NoteScreen() {
     [vaultId, path],
   );
 
-  const onChangeDraft = useCallback(
+  const onChangeFromEditor = useCallback(
     (text: string) => {
-      setDraft((prev) => {
-        // Snapshot the previous state for undo, at most every 800 ms so each
-        // burst of typing becomes one undo step (rather than one per keypress).
-        const now = Date.now();
-        if (now - lastSnapshotTime.current > 800 && prev !== text) {
-          lastSnapshotTime.current = now;
-          setUndoStack((s) => [...s, prev].slice(-100));
-          setRedoStack((r) => (r.length ? [] : r));
-        }
-        return text;
-      });
+      draftRef.current = text;
       setSaveState('dirty');
       if (saveTimer.current) clearTimeout(saveTimer.current);
       saveTimer.current = setTimeout(() => flushSave(text), SAVE_DEBOUNCE_MS);
     },
     [flushSave],
   );
-
-  const undo = useCallback(() => {
-    setUndoStack((stack) => {
-      if (stack.length === 0) return stack;
-      const prev = stack[stack.length - 1];
-      setRedoStack((r) => [...r, draft]);
-      setDraft(prev);
-      lastSnapshotTime.current = 0;
-      if (saveTimer.current) clearTimeout(saveTimer.current);
-      saveTimer.current = setTimeout(() => flushSave(prev), SAVE_DEBOUNCE_MS);
-      setSaveState('dirty');
-      return stack.slice(0, -1);
-    });
-  }, [draft, flushSave]);
-
-  const redo = useCallback(() => {
-    setRedoStack((stack) => {
-      if (stack.length === 0) return stack;
-      const next = stack[stack.length - 1];
-      setUndoStack((u) => [...u, draft]);
-      setDraft(next);
-      lastSnapshotTime.current = 0;
-      if (saveTimer.current) clearTimeout(saveTimer.current);
-      saveTimer.current = setTimeout(() => flushSave(next), SAVE_DEBOUNCE_MS);
-      setSaveState('dirty');
-      return stack.slice(0, -1);
-    });
-  }, [draft, flushSave]);
 
   useEffect(
     () => () => {
@@ -153,86 +101,38 @@ export default function NoteScreen() {
     [],
   );
 
-  const enterEdit = useCallback(() => {
-    setEditing(true);
-    requestAnimationFrame(() => inputRef.current?.focus());
-  }, []);
-
-  const commitAndExit = useCallback(async () => {
-    if (draft !== original) {
-      if (saveTimer.current) clearTimeout(saveTimer.current);
-      await flushSave(draft);
+  const onBack = useCallback(async () => {
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    if (draftRef.current !== original && original !== null) {
+      await flushSave(draftRef.current);
     }
-    inputRef.current?.blur();
-    setEditing(false);
-  }, [draft, original, flushSave]);
-
-  const wrap = useCallback(
-    (before: string, after: string, placeholder = 'text') => {
-      const { start, end } = selection;
-      const selected = draft.slice(start, end);
-      const inner = selected || placeholder;
-      const insert = before + inner + after;
-      const next = draft.slice(0, start) + insert + draft.slice(end);
-      onChangeDraft(next);
-      const newStart = start + before.length;
-      const newEnd = newStart + inner.length;
-      requestAnimationFrame(() => {
-        inputRef.current?.setNativeProps({ selection: { start: newStart, end: newEnd } });
-      });
-      setSelection({ start: newStart, end: newEnd });
-    },
-    [draft, selection, onChangeDraft],
-  );
-
-  const prefixLine = useCallback(
-    (prefix: string) => {
-      const { start } = selection;
-      const lineStart = draft.lastIndexOf('\n', start - 1) + 1;
-      const next = draft.slice(0, lineStart) + prefix + draft.slice(lineStart);
-      onChangeDraft(next);
-      const newPos = start + prefix.length;
-      requestAnimationFrame(() => {
-        inputRef.current?.setNativeProps({ selection: { start: newPos, end: newPos } });
-      });
-      setSelection({ start: newPos, end: newPos });
-    },
-    [draft, selection, onChangeDraft],
-  );
+    router.back();
+  }, [original, flushSave]);
 
   const filename = basename(path);
   const title = filename.replace(/\.md$/i, '');
-  const body = original === null ? '' : splitFrontmatter(draft).body;
 
+  // Toolbar wires to the WebView editor — CM6 owns the cursor + history.
   const toolbarActions = {
-    onUndo: undo,
-    onRedo: redo,
-    canUndo,
-    canRedo,
-    onH1: () => prefixLine('# '),
-    onBold: () => wrap('**', '**', 'bold'),
-    onItalic: () => wrap('*', '*', 'italic'),
-    onList: () => prefixLine('- '),
-    onLink: () => wrap('[', '](url)', 'text'),
-    onCode: () => wrap('`', '`', 'code'),
-    onDone: commitAndExit,
+    onUndo: () => editorRef.current?.undo(),
+    onRedo: () => editorRef.current?.redo(),
+    onH1: () => editorRef.current?.prefixLine('# '),
+    onBold: () => editorRef.current?.wrap('**', '**', 'bold'),
+    onItalic: () => editorRef.current?.wrap('*', '*', 'italic'),
+    onList: () => editorRef.current?.prefixLine('- '),
+    onLink: () => editorRef.current?.wrap('[', '](url)', 'text'),
+    onCode: () => editorRef.current?.wrap('`', '`', 'code'),
+    onDismiss: () => {
+      editorRef.current?.blur();
+      Keyboard.dismiss();
+    },
   };
 
   return (
     <Screen edges={['top']} safe={true}>
       <View style={styles.header}>
-        <Pressable
-          onPress={() => {
-            if (editing) commitAndExit();
-            else router.back();
-          }}
-          hitSlop={12}
-        >
-          <IconSymbol
-            name={editing ? 'checkmark' : 'chevron.left'}
-            size={22}
-            color={editing ? theme.accent : theme.textDim}
-          />
+        <Pressable onPress={onBack} hitSlop={12}>
+          <IconSymbol name="chevron.left" size={22} color={theme.textDim} />
         </Pressable>
         <View style={{ flex: 1, marginHorizontal: space[3] }}>
           <Text variant="bodyEm" color={theme.text} numberOfLines={1}>
@@ -241,11 +141,6 @@ export default function NoteScreen() {
         </View>
         <View style={styles.headerRight}>
           <StatusDot state={saveState} />
-          {!editing ? (
-            <Pressable onPress={enterEdit} hitSlop={12} style={{ marginLeft: space[3] }}>
-              <IconSymbol name="pencil" size={20} color={theme.textDim} />
-            </Pressable>
-          ) : null}
         </View>
       </View>
 
@@ -261,55 +156,34 @@ export default function NoteScreen() {
         <View style={styles.centered}>
           <ActivityIndicator color={theme.accent} />
         </View>
-      ) : editing ? (
-        <View style={{ flex: 1 }}>
-          <ScrollView
-            style={{ flex: 1 }}
-            contentContainerStyle={[
-              styles.editScroll,
-              // Leave room at the bottom of the text for the keyboard + the
-              // floating toolbar so the cursor never ends up hidden.
-              { paddingBottom: keyboardHeight + 80 },
-            ]}
-            keyboardShouldPersistTaps="handled"
-          >
-            <TextInput
-              ref={inputRef}
-              value={draft}
-              onChangeText={onChangeDraft}
-              onSelectionChange={(e) => setSelection(e.nativeEvent.selection)}
-              multiline
-              autoCapitalize="sentences"
-              autoCorrect
-              textAlignVertical="top"
-              placeholder="Start writing…"
-              placeholderTextColor={theme.mutedDeep}
-              selectionColor={theme.accent}
-              style={[styles.editor, { color: theme.text }]}
-            />
-          </ScrollView>
-          <View
-            pointerEvents="box-none"
-            style={[styles.toolbarOverlay, { bottom: keyboardHeight }]}
-          >
-            <FloatingToolbar {...toolbarActions} />
-          </View>
-        </View>
       ) : (
-        // Read mode: the ScrollView handles scrolling. A Pressable inside the
-        // contentContainer catches a TAP on the rendered content without
-        // eating scroll gestures (scroll = drag, tap = quick touch).
-        <ScrollView contentContainerStyle={styles.readScroll}>
-          <Pressable onPress={enterEdit} style={{ minHeight: '100%' }}>
-            {body.trim() ? (
-              <MarkdownViewer source={body} />
-            ) : (
-              <Text variant="body" color={theme.mutedDeep}>
-                Empty note. Tap to start writing.
-              </Text>
-            )}
-          </Pressable>
-        </ScrollView>
+        <View style={{ flex: 1 }}>
+          {/*
+            Wrapper shrinks the editor's frame so its bottom edge is just
+            above the floating toolbar + keyboard. CodeMirror handles its
+            own caret-tracking inside that frame.
+          */}
+          <View
+            style={{
+              flex: 1,
+              paddingBottom: keyboardHeight > 0 ? keyboardHeight + TOOLBAR_HEIGHT : 0,
+            }}
+          >
+            <MarkdownEditor
+              ref={editorRef}
+              initialValue={original ?? ''}
+              onChange={onChangeFromEditor}
+            />
+          </View>
+          {keyboardHeight > 0 ? (
+            <View
+              pointerEvents="box-none"
+              style={[styles.toolbarOverlay, { bottom: keyboardHeight }]}
+            >
+              <FloatingToolbar {...toolbarActions} />
+            </View>
+          ) : null}
+        </View>
       )}
     </Screen>
   );
@@ -337,15 +211,13 @@ function StatusDot({ state }: { state: SaveState }) {
 type ToolbarActions = {
   onUndo: () => void;
   onRedo: () => void;
-  canUndo: boolean;
-  canRedo: boolean;
   onH1: () => void;
   onBold: () => void;
   onItalic: () => void;
   onList: () => void;
   onLink: () => void;
   onCode: () => void;
-  onDone: () => void;
+  onDismiss: () => void;
 };
 
 function FloatingToolbar(props: ToolbarActions) {
@@ -355,20 +227,15 @@ function FloatingToolbar(props: ToolbarActions) {
     icon,
     letter,
     onPress,
-    disabled,
   }: {
     icon?: Parameters<typeof IconSymbol>[0]['name'];
     letter?: string;
     onPress: () => void;
-    disabled?: boolean;
   }) => (
     <Pressable
-      onPress={disabled ? undefined : onPress}
+      onPress={onPress}
       hitSlop={4}
-      style={({ pressed }) => [
-        styles.pillBtn,
-        { opacity: disabled ? 0.3 : pressed ? 0.6 : 1 },
-      ]}
+      style={({ pressed }) => [styles.pillBtn, { opacity: pressed ? 0.6 : 1 }]}
     >
       {icon ? (
         <IconSymbol name={icon} size={18} color={theme.text} />
@@ -397,8 +264,8 @@ function FloatingToolbar(props: ToolbarActions) {
           keyboardShouldPersistTaps="always"
           contentContainerStyle={styles.toolbarRowInner}
         >
-          <IconBtn icon="arrow.uturn.backward" onPress={props.onUndo} disabled={!props.canUndo} />
-          <IconBtn icon="arrow.uturn.forward" onPress={props.onRedo} disabled={!props.canRedo} />
+          <IconBtn icon="arrow.uturn.backward" onPress={props.onUndo} />
+          <IconBtn icon="arrow.uturn.forward" onPress={props.onRedo} />
           <IconBtn letter="H" onPress={props.onH1} />
           <IconBtn letter="B" onPress={props.onBold} />
           <IconBtn letter="I" onPress={props.onItalic} />
@@ -409,7 +276,7 @@ function FloatingToolbar(props: ToolbarActions) {
       </LiquidPill>
       <LiquidPill style={styles.dismissPill} radius={22}>
         <Pressable
-          onPress={props.onDone}
+          onPress={props.onDismiss}
           hitSlop={6}
           style={({ pressed }) => [styles.pillBtn, { opacity: pressed ? 0.6 : 1 }]}
         >
@@ -430,24 +297,6 @@ const styles = StyleSheet.create({
   },
   headerRight: { flexDirection: 'row', alignItems: 'center' },
   centered: { flex: 1, justifyContent: 'center', alignItems: 'center', padding: space[6] },
-  readScroll: {
-    paddingHorizontal: space[5],
-    paddingTop: space[4],
-    paddingBottom: space[14],
-    flexGrow: 1,
-  },
-  editScroll: {
-    paddingHorizontal: space[5],
-    paddingTop: space[4],
-    paddingBottom: space[8],
-    flexGrow: 1,
-  },
-  editor: {
-    flex: 1,
-    fontSize: 17,
-    lineHeight: 26,
-    minHeight: 300,
-  },
   errorBar: {
     marginHorizontal: space[5],
     marginTop: space[2],
@@ -456,7 +305,6 @@ const styles = StyleSheet.create({
     borderRadius: radii.md,
   },
   dot: { marginRight: 2 },
-
   toolbarOverlay: {
     position: 'absolute',
     left: 0,

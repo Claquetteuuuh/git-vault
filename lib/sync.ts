@@ -5,7 +5,7 @@ import http from 'isomorphic-git/http/web';
 
 import { createGitFs } from '@/lib/git-fs';
 import { vaultDirUri } from '@/lib/git';
-import { commitAll } from '@/lib/git';
+import { commitPaths } from '@/lib/git';
 import type { Vault } from '@/lib/types';
 
 const dir = '/repo';
@@ -30,12 +30,11 @@ export type SyncResult = {
 
 export type SyncOptions = {
   /**
-   * Skip `statusMatrix` and `commitAll` entirely when the caller knows the
-   * working tree is clean (e.g. `vault.dirty === false`). This is the slow
-   * path on mobile, so skipping it turns a multi-minute stall into a quick
-   * fetch/push negotiation.
+   * Explicit list of paths to commit before syncing. This is the fast
+   * path — no `statusMatrix` walk. Passed in from the vault store's
+   * `dirtyPaths` tracker. When empty/undefined, we skip commit entirely.
    */
-  skipCommitIfClean?: boolean;
+  dirtyPaths?: string[];
 };
 
 export async function syncVault(
@@ -50,27 +49,39 @@ export async function syncVault(
   const ref = vault.branch;
   const remoteRef = `refs/remotes/origin/${ref}`;
 
+  const dirtyPaths = opts.dirtyPaths ?? [];
   let autoCommitSha: string | null = null;
-  if (!opts.skipCommitIfClean) {
-    onStatus?.('Committing local changes');
-    autoCommitSha = await commitAll(
+  if (dirtyPaths.length > 0) {
+    onStatus?.(`Committing ${dirtyPaths.length} file(s)`);
+    autoCommitSha = await commitPaths(
       vault,
+      dirtyPaths,
       `GitVault auto-commit ${new Date().toISOString()}`,
       user,
     );
   }
 
-  onStatus?.('Fetching');
-  await git.fetch({
-    fs,
-    http,
-    dir,
-    remote: 'origin',
-    ref,
-    singleBranch: true,
-    tags: false,
-    onAuth,
-  });
+  // Same optimisation as fetchVault: ls-remote first, skip the packfile
+  // fetch if the remote hasn't moved.
+  onStatus?.('Checking remote refs');
+  const remoteHeadOid = await peekRemoteHead(vault, auth);
+  const localRemoteOid = await readLocalRemoteOid(fs, ref);
+  const remoteMoved =
+    remoteHeadOid !== null && localRemoteOid !== null && remoteHeadOid !== localRemoteOid;
+
+  if (remoteMoved || !remoteHeadOid || !localRemoteOid) {
+    onStatus?.('Fetching new commits');
+    await git.fetch({
+      fs,
+      http,
+      dir,
+      remote: 'origin',
+      ref,
+      singleBranch: true,
+      tags: false,
+      onAuth,
+    });
+  }
 
   let pulled = false;
   const conflicts: string[] = [];
@@ -145,9 +156,41 @@ export async function syncVault(
 }
 
 /**
- * Lightweight variant: just `git.fetch` the branch, then report whether the
- * remote has advanced beyond our local ref. No commit, no push, no checkout.
- * Intended for the passive "is there something new?" check on vault open.
+ * Asks the remote for its ref list without downloading any objects.
+ * Equivalent to `git ls-remote` — few KB of HTTP, typically <1 s.
+ */
+async function peekRemoteHead(
+  vault: Vault,
+  auth: { token: string },
+): Promise<string | null> {
+  try {
+    const info = await git.getRemoteInfo({
+      http,
+      url: vault.cloneUrl,
+      onAuth: () => ({ username: 'oauth2', password: auth.token }),
+    });
+    return info.refs?.heads?.[vault.branch] ?? null;
+  } catch {
+    return null;
+  }
+}
+
+async function readLocalRemoteOid(
+  fs: ReturnType<typeof createGitFs>,
+  branch: string,
+): Promise<string | null> {
+  try {
+    return await git.resolveRef({ fs, dir, ref: `refs/remotes/origin/${branch}` });
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Lightweight variant: ask the remote for its HEAD oid (no packfile),
+ * compare with our cached remote-tracking ref. Only runs a real `git.fetch`
+ * when the remote has actually advanced. Intended for the passive
+ * "is there something new?" check on vault open.
  */
 export async function fetchVault(
   vault: Vault,
@@ -159,7 +202,18 @@ export async function fetchVault(
   const ref = vault.branch;
   const remoteRef = `refs/remotes/origin/${ref}`;
 
-  onStatus?.('Checking remote');
+  onStatus?.('Checking remote refs');
+  const remoteHeadOid = await peekRemoteHead(vault, auth);
+  const localRemoteOid = await readLocalRemoteOid(fs, ref);
+
+  if (remoteHeadOid && localRemoteOid && remoteHeadOid === localRemoteOid) {
+    // Remote hasn't advanced — skip the (slow) packfile fetch entirely.
+    onStatus?.('Up to date');
+    const localOid = await git.resolveRef({ fs, dir, ref });
+    return { remoteAhead: localOid !== localRemoteOid };
+  }
+
+  onStatus?.('Fetching new commits');
   await git.fetch({
     fs,
     http,

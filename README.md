@@ -1,50 +1,74 @@
-# Welcome to your Expo app 👋
+# GitVault
 
-This is an [Expo](https://expo.dev) project created with [`create-expo-app`](https://www.npmjs.com/package/create-expo-app).
+Mobile markdown notebook that syncs with a GitHub repository over the Device Flow — an alternative to Obsidian Mobile for users who keep their notes in Git.
 
-## Get started
+> POC / alpha. Built with Expo SDK 54, TypeScript, `expo-router`, `isomorphic-git`.
 
-1. Install dependencies
+## What works today
 
-   ```bash
-   npm install
-   ```
+- GitHub OAuth **Device Flow** login — no password, no client secret.
+- Clone a repo (shallow, `depth: 1`) into the app's sandbox.
+- Browse folders and markdown files.
+- Read notes with a themed markdown renderer (YAML frontmatter stripped).
+- Edit notes with a plain `TextInput`. Saves debounced to disk.
+- Smart sync:
+  - auto-commit any local changes,
+  - fetch + fast-forward/trivial merge when possible,
+  - on real divergence, keep the remote version and preserve local edits in `<file>.conflict-YYYY-MM-DD.md`,
+  - push.
+- Manual sync button in the vault header, automatic sync on vault open, debounced sync after edits, and push when the app is backgrounded.
 
-2. Start the app
+## What's explicitly out of scope (for now)
 
-   ```bash
-   npx expo start
-   ```
+Images / attachments, wikilinks `[[note]]`, backlinks, graph view, plugins, full-text search, GitLab, CodeMirror editor.
 
-In the output, you'll find options to open the app in a
+## Running the POC
 
-- [development build](https://docs.expo.dev/develop/development-builds/introduction/)
-- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
-- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
-- [Expo Go](https://expo.dev/go), a limited sandbox for trying out app development with Expo
+Prereqs: Node 20+, Expo Go on your phone.
 
-You can start developing by editing the files inside the **app** directory. This project uses [file-based routing](https://docs.expo.dev/router/introduction).
-
-## Get a fresh project
-
-When you're ready, run:
-
-```bash
-npm run reset-project
+```sh
+cd gitvault-mobile
+npm install
+npx expo start
 ```
 
-This command will move the starter code to the **app-example** directory and create a blank **app** directory where you can start developing.
+Scan the QR code with Expo Go. On first launch, tap **Connect GitHub** and follow the Device Flow instructions (copy the 8-character code, paste it on github.com/login/device, approve).
 
-## Learn more
+## Configuration
 
-To learn more about developing your project with Expo, look at the following resources:
+The GitHub **Client ID** is set in `lib/github-oauth.ts`. Device Flow does not require a client secret. If you fork this project, register your own OAuth App at <https://github.com/settings/developers> with "Enable Device Flow" turned on, and replace the ID.
 
-- [Expo documentation](https://docs.expo.dev/): Learn fundamentals, or go into advanced topics with our [guides](https://docs.expo.dev/guides).
-- [Learn Expo tutorial](https://docs.expo.dev/tutorial/introduction/): Follow a step-by-step tutorial where you'll create a project that runs on Android, iOS, and the web.
+## Architecture
 
-## Join the community
+```
+app/                     expo-router screens
+  _layout.tsx            root Stack + AppState sync
+  index.tsx              vault list
+  onboarding.tsx         Device Flow UI
+  settings.tsx           account / vaults / conflicts
+  vault/new.tsx          repo picker + URL clone
+  vault/[vaultId]/
+    _layout.tsx
+    index.tsx            file explorer + sync control
+    note.tsx             reader / editor
 
-Join our community of developers creating universal apps.
+lib/
+  github-oauth.ts        Device Flow helpers
+  git.ts                 isomorphic-git wrappers
+  git-fs.ts              expo-file-system → fs.promises adapter
+  vault-fs.ts            user-level file ops (list, read, write)
+  sync.ts                commit + fetch + merge + push orchestration
+  sync-controller.ts     per-vault serialisation + store updates
+  app-state-sync.tsx     background-transition listener
+  frontmatter.ts         YAML split helper
+  polyfills.ts           Buffer global
 
-- [Expo on GitHub](https://github.com/expo/expo): View our open source platform and contribute.
-- [Discord community](https://chat.expo.dev): Chat with Expo users and ask questions.
+store/                   zustand stores (auth, vaults, sync)
+```
+
+## Known caveats
+
+- **Shallow clone only.** `depth: 1` keeps clone times reasonable; history-heavy operations (blame, log beyond the last commit) aren't supported.
+- **Slow on large repos.** `isomorphic-git` is pure JS over `expo-file-system`, which is fine for small vaults but can be sluggish on hundreds-of-MB repos. A 100 MB vault will take noticeable minutes to first-clone on a phone.
+- **Merge capability is minimal.** `isomorphic-git` merges only cleanly-fast-forwardable or trivially-mergeable histories. Real divergence goes through the conflict-file fallback rather than a three-way merge UI.
+- **No background intervals.** Mobile OSes do not reliably run user-defined background tasks on a 5-minute cadence. GitVault syncs on open, on edit, on manual tap, and on app-backgrounded transitions instead.
